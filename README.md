@@ -202,10 +202,6 @@ func init() {
 
 It automatically appears in `help` and command lookup — no other wiring.
 
-## License
-
-MIT (or replace with your license).
-
 ## Responsible disclosure
 
 Found a bug in goshell itself? Open an issue or contact the maintainers privately. Please do not open issues describing unauthorized use.
