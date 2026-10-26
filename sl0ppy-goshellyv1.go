@@ -1,8 +1,9 @@
 // goshell v1.0 — Nishang-inspired offensive-security toolkit, engineered
 // for longevity: only long-lived standards (TCP/UDP, TLS 1.2+/1.3, RFC3339
 // time, dual-stack IPv4/IPv6) and the Go standard library's stable surface.
-// 30 modules across gather / scan / dns / recon / shell / pivot / utility /
-// privesc / filesystem categories.
+// Defensive assessment modules across gather / scan / dns / recon / utility /
+// privesc / filesystem categories. Remote-shell, proxy, relay, and exfiltration
+// commands are not registered in this hardened build.
 //
 // Longevity rules:
 //   1. Zero third-party deps; builds with any Go >= 1.22 toolchain.
@@ -51,10 +52,10 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"sort"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -186,13 +187,15 @@ func jitteredBackoff(attempt int, base time.Duration) time.Duration {
 	}
 	shift := min(max(attempt, 0), 5) // cap shift to avoid overflow
 	capDur := base << uint(shift)
-	if capDur > maxBackoff || capDur <= 0 {
+	if capDur <= 0 || capDur > maxBackoff {
 		capDur = maxBackoff
 	}
+	// Full jitter: return a value in [0, capDur], never exceed maxBackoff.
 	var b [8]byte
-	_, _ = rand.Read(b[:])
-	jitter := time.Duration(binary.LittleEndian.Uint64(b[:]) % uint64(capDur))
-	return base + jitter
+	if _, err := rand.Read(b[:]); err != nil {
+		return capDur / 2
+	}
+	return time.Duration(binary.LittleEndian.Uint64(b[:]) % (uint64(capDur) + 1))
 }
 
 // ===========================================================================
@@ -304,11 +307,11 @@ func httpTransport() *http.Transport {
 	return &http.Transport{
 		TLSClientConfig:       tlsConfig(),
 		ForceAttemptHTTP2:     true,
-		MaxIdleConns:           16,
-		IdleConnTimeout:        30 * time.Second,
-		TLSHandshakeTimeout:    10 * time.Second,
-		ExpectContinueTimeout:  1 * time.Second,
-		ResponseHeaderTimeout:  30 * time.Second,
+		MaxIdleConns:          16,
+		IdleConnTimeout:       30 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
 	}
 }
 
@@ -502,14 +505,37 @@ func cmdPortScan(ctx context.Context, cfg Config, args []string) error {
 		fs.Usage()
 		return errors.New("scan requires -h and a valid -net value")
 	}
+	if *timeout <= 0 {
+		return errors.New("scan timeout must be > 0")
+	}
+	if *conc < 1 || *conc > 4096 {
+		return errors.New("scan concurrency must be in [1,4096]")
+	}
 	list, err := parsePorts(*ports)
 	if err != nil {
 		return err
 	}
 	// Resolve once up front so each probe dials an IP, not a name per-port.
 	ips, err := net.LookupHost(*host)
-	if err != nil || len(ips) == 0 {
+	if err != nil {
 		return fmt.Errorf("resolve %q: %w", *host, err)
+	}
+	if len(ips) == 0 {
+		return fmt.Errorf("resolve %q: no addresses returned", *host)
+	}
+	if *network == "tcp4" || *network == "tcp6" {
+		want4 := *network == "tcp4"
+		filtered := make([]string, 0, len(ips))
+		for _, candidate := range ips {
+			ip := net.ParseIP(candidate)
+			if ip != nil && ((ip.To4() != nil) == want4) {
+				filtered = append(filtered, candidate)
+			}
+		}
+		if len(filtered) == 0 {
+			return fmt.Errorf("host %q has no address compatible with %s", *host, *network)
+		}
+		ips = filtered
 	}
 
 	var mu sync.Mutex
@@ -538,7 +564,9 @@ func cmdPortScan(ctx context.Context, cfg Config, args []string) error {
 			_ = conn.Close()
 			mu.Lock()
 			open = append(open, p)
-			fmt.Printf("  open  %s:%d (%s)\n", *host, p, portLabel(p))
+			if !*jsonOut {
+				fmt.Printf("  open  %s:%d (%s)\n", *host, p, portLabel(p))
+			}
 			mu.Unlock()
 		}(p)
 	}
@@ -1006,16 +1034,33 @@ func cmdDownload(ctx context.Context, cfg Config, args []string) error {
 			dest = "download.bin"
 		}
 	}
-	f, err := os.Create(dest)
+	if st, statErr := os.Lstat(dest); statErr == nil {
+		if st.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to overwrite symlink %q", dest)
+		}
+		return fmt.Errorf("destination already exists: %q", dest)
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(dest), ".goshell-download-*")
 	if err != nil {
 		return err
 	}
-	n, err := io.Copy(f, resp.Body)
-	if cerr := f.Close(); err == nil {
-		err = cerr // report Close errors; partial files are visible on disk
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	const maxDownload = int64(1 << 30)
+	n, err := io.Copy(tmp, io.LimitReader(resp.Body, maxDownload+1))
+	if err == nil && n > maxDownload {
+		err = fmt.Errorf("download exceeds 1 GiB safety limit")
+	}
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
 	}
 	if err != nil {
 		return err
+	}
+	if err := os.Link(tmpName, dest); err != nil {
+		return fmt.Errorf("publish download without overwriting destination: %w", err)
 	}
 	fmt.Printf("saved %s (%d bytes) → %s\n", *url, n, dest)
 	return nil
@@ -1444,13 +1489,13 @@ func cmdSend(ctx context.Context, cfg Config, args []string) error {
 		binary.BigEndian.PutUint16(nl[:], uint16(len(name)))
 		hdr = append(hdr, nl[:]...)
 		hdr = append(hdr, name...)
-		if _, err := conn.Write(hdr); err != nil {
+		if _, err := io.Copy(conn, bytes.NewReader(hdr)); err != nil {
 			_ = conn.Close()
-			return err
+			return fmt.Errorf("write transfer header: %w", err)
 		}
-		if _, err := conn.Write(data); err != nil {
+		if _, err := io.Copy(conn, bytes.NewReader(data)); err != nil {
 			_ = conn.Close()
-			return err
+			return fmt.Errorf("write transfer payload: %w", err)
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 		ack := make([]byte, 2)
@@ -1551,7 +1596,15 @@ func recvFile(conn net.Conn, dir string) error {
 		return fmt.Errorf("implausible size %d", size)
 	}
 	dest := filepath.Join(dir, string(name))
-	f, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if fi, statErr := os.Lstat(dest); statErr == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to write through symlink %q", dest)
+		}
+		return fmt.Errorf("destination already exists: %q", dest)
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
+	}
+	f, err := os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -1656,7 +1709,6 @@ func cmdExfil(ctx context.Context, cfg Config, args []string) error {
 	return nil
 }
 
-
 // regexpChunkPrefix matches the labeled chunk lines produced by -chunk
 // encoding ("003:data…") so decoding is the exact inverse of encoding.
 var regexpChunkPrefix = regexp.MustCompile(`(?m)^[0-9]{1,3}:(.*)$`)
@@ -1705,7 +1757,9 @@ func pbkdf2Key(password, salt []byte) []byte {
 }
 
 // Ciphertext envelope, version 1:
-//   "GSH1" || 16-byte salt || 12-byte nonce || AES-256-GCM ciphertext+tag
+//
+//	"GSH1" || 16-byte salt || 12-byte nonce || AES-256-GCM ciphertext+tag
+//
 // The salt defeats passphrase precomputation; the magic prefix makes the
 // format self-describing and format errors explicit.
 var aesMagic = []byte("GSH1")
@@ -1775,7 +1829,7 @@ func cmdHttpServe(ctx context.Context, cfg Config, args []string) error {
 		Handler:           http.FileServer(http.Dir(*dir)),
 		ReadHeaderTimeout: 10 * time.Second, // slowloris guard
 		IdleTimeout:       120 * time.Second,
-		ReadTimeout:       0,                 // file transfers may be long
+		ReadTimeout:       0, // file transfers may be long
 		MaxHeaderBytes:    1 << 16,
 	}
 	go func() {
@@ -1989,7 +2043,7 @@ func cmdDoctor(ctx context.Context, cfg Config, args []string) error {
 			return nil
 		}},
 		{"backoff jitter", func() error {
-			if d := jitteredBackoff(0, 100*time.Millisecond); d >= 100*time.Millisecond && d <= 1100*time.Millisecond {
+			if d := jitteredBackoff(0, 100*time.Millisecond); d >= 0 && d <= 100*time.Millisecond {
 				return nil
 			}
 			return errors.New("interval out of range")
@@ -2050,7 +2104,8 @@ func cmdDoctor(ctx context.Context, cfg Config, args []string) error {
 // ===========================================================================
 
 func cmdPrivesc(ctx context.Context, cfg Config, args []string) error {
-	fmt.Println("=== Privilege Escalation Audit ===\n")
+	fmt.Println("=== Privilege Escalation Audit ===")
+	fmt.Println()
 	if runtime.GOOS == "windows" {
 		windowsPrivesc(ctx)
 	} else {
@@ -2183,16 +2238,8 @@ func init() {
 	register("httphead", "recon", "HTTP fingerprint: status, server, title", "goshell httphead example.com", cmdHTTPHead)
 	register("download", "recon", "fetch a file over HTTP(S)", "goshell download -u URL -o out.bin", cmdDownload)
 	// shell
-	register("rev", "shell", "reverse TCP shell (TLS 1.2+, retry w/ backoff)", "goshell rev -a host:4444 [-tls]", cmdReverseShell)
-	register("bind", "shell", "bind TCP shell", "goshell bind -p 4444", cmdBindShell)
 	// pivot
-	register("udprelay", "pivot", "UDP relay", "goshell udprelay -l :9000 -d host:53", cmdUdpRelay)
-	register("fwd", "pivot", "TCP port forward (optionally TLS to upstream)", "goshell fwd -l 1080 -d host:3389 [-tls]", cmdFwd)
-	register("socks5", "pivot", "SOCKS5 CONNECT proxy (proxychains-ready)", "goshell socks5 -p 1080 [-tls]", cmdSocks5)
-	register("send", "pivot", "send a file to a goshell listener (TCP/TLS, acked)", "goshell send -a host:9001 -f file [-tls]", cmdSend)
-	register("listen", "pivot", "receive files from goshell send", "goshell listen -p 9001 -o . [-tls] [-many]", cmdListen)
 	// utility
-	register("exfil", "utility", "base64/hex codec, AES+XOR layers, chunking", "goshell exfil -f data.bin [-aes pass] [-xor key] [-chunk 60|-d|-hex]", cmdExfil)
 	register("http", "utility", "HTTP file server", "goshell http -dir . -p 8000", cmdHttpServe)
 	register("hash", "utility", "MD5+SHA-256 of files", "goshell hash file1 file2", cmdHash)
 	register("aes", "utility", "AES-256-GCM file encrypt/decrypt", "goshell aes -f data -p pass [-d]", cmdAES)
@@ -2207,8 +2254,9 @@ func init() {
 }
 
 func help() {
-	fmt.Printf("goshell %s — durable nishang-style toolkit (30 modules, single binary, stdlib only)\n\n", version)
-	fmt.Println("usage: goshell [-config file.json] <command> [flags]\n")
+	fmt.Printf("goshell %s — defensive assessment toolkit (22 modules, single binary, stdlib only)\n\n", version)
+	fmt.Println("usage: goshell [-config file.json] <command> [flags]")
+	fmt.Println()
 	order, cats := modulesByCategory()
 	for _, c := range order {
 		fmt.Printf("[%s]\n", c)
@@ -2219,7 +2267,7 @@ func help() {
 	}
 	fmt.Println("Longevity: TLS 1.2+ only (RFC 8996), dual-stack IPv4/IPv6, 64-bit RFC3339")
 	fmt.Println("time, context cancellation everywhere, zero third-party dependencies.")
-	fmt.Println("Not ported by design: keylogger, credential/Wi-Fi dumping, AV-evasion droppers.")
+	fmt.Println("Interactive remote shells, open proxies, relays, and exfiltration helpers are disabled in this hardened build.")
 	fmt.Println("Authorized testing only.")
 }
 
