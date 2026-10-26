@@ -3,7 +3,7 @@
 **A lightweight, standard-library-only system and network assessment toolkit**  
 **Author:** Patrick Hoogeveen (`x0xr00t`)  
 **Team:** Team Sl0ppyRoot  
-**Current source version:** `0.6.0`
+**Current source version:** `1.0`
 
 > **Important — rebuild the binary after updating the source.**
 >
